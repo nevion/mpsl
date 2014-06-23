@@ -9,6 +9,8 @@
 #include <string>
 
 #include "mpsl/types.h"
+#include "mpsl/iovec.h"
+
 //basic operations
 namespace mpsl{
 
@@ -154,4 +156,108 @@ namespace mpsl{
     }
 
 }
+
+//vector extensions
+namespace mpsl{
+    struct IOVecWriteResult : public WriteResult{
+        iovec_inplace_iterator iterator;//iterator to the current iovec sequence
+        inline IOVecWriteResult():WriteResult(), iterator(){}
+        inline IOVecWriteResult(bool success, int errnum, size_t written, iovec_inplace_iterator iterator): WriteResult(success, errnum, written), iterator(iterator){}
+    };
+
+    inline IOVecWriteResult write_all_inplace(int fd, struct iovec *iov, const size_t iovcnt){
+        iovec_inplace_iterator iov_it(iov, iovcnt);
+        int lerrno = 0;
+        size_t running_total = 0;
+
+        for(;!iov_it.eov();){
+            assert(iov_it.iov_remaining() <= iovcnt);
+            assert(iov_it.head() >= iov && iov_it.head() <= iov_it.end());
+            int written = ::writev(fd, iov_it.head(), iov_it.iov_remaining());
+            if(written == -1){
+                lerrno = errno;
+                if(lerrno == EINTR){
+                    continue;
+                }
+                break;
+            }else if(written == 0){
+                lerrno = ENOSPC;
+                break;
+            }
+            running_total += written;
+            iov_it.advance((size_t) written);
+        }
+        const bool success = iov_it.eov();
+        return IOVecWriteResult(success, lerrno, running_total, iov_it);
+    }
+
+    inline WriteResult write_all(int fd, const BufferSet &buffer){
+        std::vector<struct iovec> iov(buffer.iov, buffer.iov + buffer.count);
+        return write_all_inplace(fd, iov.data(), buffer.count);
+    }
+
+    template<size_t N>
+    inline WriteResult write_all(int fd, const std::array<struct iovec, N> &iov){
+        std::array<struct iovec, N> iov_copy = iov;
+        return write_all_inplace(fd, iov_copy.data(), iov_copy.size());
+    }
+
+    template<typename... Args>
+    inline WriteResult write(int fd, Args&&... pods){
+        auto buffers = make_iovec_array(std::forward<Args>(pods)...);
+        return write_all_inplace(fd, buffers.data(), buffers.size());
+    }
+
+    struct IOVecReadResult : public ReadResult{
+        iovec_inplace_iterator iterator;//iterator to the current iovec sequence
+        inline IOVecReadResult():ReadResult(), iterator(){}
+        inline IOVecReadResult(bool success, bool eof, int errnum, size_t nread, iovec_inplace_iterator iterator): ReadResult(success, eof, errnum, nread), iterator(iterator){}
+    };
+
+    inline ReadResult read_all_inplace(int fd, struct iovec *iov, const size_t iovcnt){
+        iovec_inplace_iterator iov_it(iov, iovcnt);
+
+        int lerrno = 0;
+        bool eof = false;
+        size_t running_total = 0;
+        for(;!iov_it.eov();){
+            assert(iov_it.iov_remaining() <= iovcnt);
+            assert(iov_it.head() >= iov && iov_it.head() <= iov_it.end());
+            int nread = ::readv(fd, iov_it.head(), iov_it.iov_remaining());
+            if(nread == -1){
+                lerrno = errno;
+                if(lerrno == EINTR){
+                    continue;
+                }
+                break;
+            }else if(nread == 0 && iov_it.any_bytes_remaining()){
+                eof = true;
+                break;
+            }
+            running_total += nread;
+            iov_it.advance((size_t) nread);
+        }
+        const bool success = iov_it.eov();
+        return IOVecReadResult(success, eof, lerrno, running_total, iov_it);
+    }
+
+    inline ReadResult read_all(int fd, BufferSet &buffer){
+        struct iovec *iov = (struct iovec *) alloca(buffer.count * sizeof(struct iovec));
+        std::copy(buffer.iov, buffer.iov + buffer.count, iov);
+        return read_all_inplace(fd, iov, buffer.count);
+    }
+
+    template<int N>
+    inline ReadResult read_all(int fd, std::array<struct iovec, N> &ios){
+        std::array<struct iovec, N> ios_copy = ios;
+        return read_all_inplace(fd, ios_copy.data(), ios_copy.size());
+    }
+
+    template<typename... Args>
+    inline ReadResult read(int fd, Args&&... pods){
+        auto buffers = make_iovec_array(std::forward<Args>(pods)...);
+        return read_all_inplace(fd, buffers.data(), buffers.size());
+    }
+}
+
 #endif
